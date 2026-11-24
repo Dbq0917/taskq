@@ -28,6 +28,10 @@ type QueueOptions struct {
 
 	// Number of messages reserved by a fetcher in the queue in one request.
 	// Default is 10 messages.
+	//
+	// Increase this when handlers finish in a few milliseconds and fetch
+	// RTT is non-trivial. Some backends additionally cap this value, for
+	// example SQS allows at most 10 messages per request.
 	ReservationSize int
 	// Time after which the reserved message is returned to the queue.
 	// Default is 5 minutes.
@@ -38,6 +42,11 @@ type QueueOptions struct {
 	WaitTimeout time.Duration
 	// Size of the buffer where reserved messages are stored.
 	// Default is the same as ReservationSize.
+	//
+	// The buffer should be a bounded prefetch window, roughly
+	// concurrency * ceil(fetchRTT / handlerDuration) plus jitter, rather
+	// than the full queue backlog. Messages outside this window remain in
+	// the broker instead of consumer memory.
 	BufferSize int
 
 	// Number of consecutive failures after which queue processing is paused.

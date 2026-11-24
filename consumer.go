@@ -55,6 +55,8 @@ type Consumer struct {
 	buffer  chan *Message // never closed
 	limiter *limiter
 
+	reserveMu sync.Mutex
+
 	startStopMu sync.Mutex
 	state       int32 // atomic
 	stopCh      chan struct{}
@@ -351,25 +353,58 @@ func (c *Consumer) ProcessOne(ctx context.Context) error {
 }
 
 func (c *Consumer) reserveOne(ctx context.Context) (*Message, error) {
-	select {
-	case msg := <-c.buffer:
+	if msg := c.bufferedMessage(); msg != nil {
 		return msg, nil
-	default:
 	}
 
-	msgs, err := c.q.ReserveN(ctx, 1, c.opt.WaitTimeout)
+	c.reserveMu.Lock()
+	defer c.reserveMu.Unlock()
+
+	if msg := c.bufferedMessage(); msg != nil {
+		return msg, nil
+	}
+
+	n := c.opt.ReservationSize
+	if n < 1 {
+		n = 1
+	}
+	if maxN := cap(c.buffer) + 1; n > maxN {
+		n = maxN
+	}
+
+	msgs, err := c.q.ReserveN(ctx, n, c.opt.WaitTimeout)
 	if err != nil && err != internal.ErrNotSupported {
 		return nil, err
 	}
-
 	if len(msgs) == 0 {
 		return nil, errors.New("taskq: queue is empty")
 	}
-	if len(msgs) != 1 {
-		return nil, fmt.Errorf("taskq: queue returned %d messages", len(msgs))
+
+	first := copyMessage(&msgs[0])
+	for i := 1; i < len(msgs); i++ {
+		msg := copyMessage(&msgs[i])
+		select {
+		case c.buffer <- msg:
+		default:
+			_ = c.q.Release(msg)
+		}
 	}
 
-	return &msgs[0], nil
+	return first, nil
+}
+
+func (c *Consumer) bufferedMessage() *Message {
+	select {
+	case msg := <-c.buffer:
+		return msg
+	default:
+		return nil
+	}
+}
+
+func copyMessage(msg *Message) *Message {
+	clone := *msg
+	return &clone
 }
 
 func (c *Consumer) fetcher(ctx context.Context, fetcherID int32) {
@@ -430,15 +465,23 @@ func (c *Consumer) fetchMessages(
 
 	timer.Reset(timeout)
 	for i := range msgs {
-		msg := &msgs[i]
+		msg := copyMessage(&msgs[i])
+		msgs[i] = Message{}
 
 		select {
 		case c.buffer <- msg:
 		case <-timer.C:
-			for i := range msgs[i:] {
-				_ = c.q.Release(&msgs[i])
+			_ = c.q.Release(msg)
+			for j := i + 1; j < len(msgs); j++ {
+				_ = c.q.Release(&msgs[j])
 			}
 			return true, nil
+		case <-c.stopCh:
+			_ = c.q.Release(msg)
+			for j := i + 1; j < len(msgs); j++ {
+				_ = c.q.Release(&msgs[j])
+			}
+			return false, nil
 		}
 	}
 
