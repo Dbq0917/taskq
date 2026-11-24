@@ -414,6 +414,160 @@ var _ = Describe("stress testing failing queue", func() {
 	})
 })
 
+var _ = Describe("byte capacity", func() {
+	ctx := context.Background()
+	var q *memqueue.Queue
+	var task *taskq.Task
+
+	BeforeEach(func() {
+		q = memqueue.NewQueue(&taskq.QueueOptions{
+			Name:    "test",
+			MaxSize: 32 * 1024,
+			Storage: taskq.NewLocalStorage(),
+		})
+		task = taskq.RegisterTask(&taskq.TaskOptions{
+			Name:    "test",
+			Handler: func([]byte) {},
+		})
+		Expect(q.Consumer().Stop()).To(Succeed())
+	})
+
+	AfterEach(func() {
+		_ = q.Purge()
+		Expect(q.Close()).To(Succeed())
+	})
+
+	message := func(size int) *taskq.Message {
+		return task.WithArgs(ctx, make([]byte, size))
+	}
+
+	messageSize := func(msg *taskq.Message) int64 {
+		b, err := msg.MarshalArgs()
+		Expect(err).NotTo(HaveOccurred())
+		return int64(len(b))
+	}
+
+	It("accounts mixed message sizes by bytes", func() {
+		var added int
+		for i := 0; ; i++ {
+			size := 128
+			if i%3 == 0 {
+				size = 8 * 1024
+			}
+
+			err := q.Add(message(size))
+			if errors.Is(err, taskq.ErrQueueFull) {
+				break
+			}
+			Expect(err).NotTo(HaveOccurred())
+			added++
+		}
+
+		Expect(added).To(BeNumerically(">", 0))
+		Expect(q.Bytes()).To(BeNumerically("<=", q.Options().MaxSize))
+
+		err := q.Add(message(8 * 1024))
+		Expect(err).To(MatchError(taskq.ErrQueueFull))
+		Expect(q.Bytes()).To(BeNumerically("<=", q.Options().MaxSize))
+	})
+
+	It("allows the exact remaining capacity and frees it on purge", func() {
+		small := message(128)
+		large := message(8 * 1024)
+		smallSize := messageSize(small)
+		largeSize := messageSize(large)
+
+		maxSize := smallSize + largeSize + smallSize
+		Expect(q.Close()).To(Succeed())
+		q = memqueue.NewQueue(&taskq.QueueOptions{
+			Name:    "test",
+			MaxSize: maxSize,
+			Storage: taskq.NewLocalStorage(),
+		})
+		Expect(q.Consumer().Stop()).To(Succeed())
+
+		Expect(q.Add(small)).To(Succeed())
+		Expect(q.Add(large)).To(Succeed())
+		Expect(q.Add(message(128))).To(Succeed())
+		Expect(q.Bytes()).To(Equal(maxSize))
+
+		Expect(q.Add(message(128))).To(MatchError(taskq.ErrQueueFull))
+		Expect(q.Bytes()).To(Equal(maxSize))
+
+		Expect(q.Purge()).To(Succeed())
+		Expect(q.Bytes()).To(BeZero())
+		Expect(q.Add(message(128))).To(Succeed())
+	})
+
+	It("does not oversubscribe capacity when enqueueing concurrently", func() {
+		const goroutines = 32
+
+		var wg sync.WaitGroup
+		wg.Add(goroutines)
+		for i := 0; i < goroutines; i++ {
+			go func() {
+				defer GinkgoRecover()
+				defer wg.Done()
+				_ = q.Add(message(4 * 1024))
+			}()
+		}
+		wg.Wait()
+
+		Expect(q.Bytes()).To(BeNumerically("<=", q.Options().MaxSize))
+		Expect(q.Bytes()).To(BeNumerically(">", 0))
+	})
+
+	It("releases capacity after messages are processed", func() {
+		for i := 0; ; i++ {
+			size := 128
+			if i%3 == 0 {
+				size = 8 * 1024
+			}
+
+			err := q.Add(message(size))
+			if errors.Is(err, taskq.ErrQueueFull) {
+				break
+			}
+			Expect(err).NotTo(HaveOccurred())
+		}
+		Expect(q.Bytes()).To(BeNumerically(">", 0))
+
+		Expect(q.Consumer().ProcessAll(ctx)).To(Succeed())
+		Expect(q.Bytes()).To(BeZero())
+
+		Expect(q.Add(message(8 * 1024))).To(Succeed())
+	})
+
+	It("keeps the reservation while a message is retried", func() {
+		retryTask := taskq.RegisterTask(&taskq.TaskOptions{
+			Name: "retry",
+			Handler: func([]byte) error {
+				return errors.New("retry")
+			},
+			RetryLimit: 2,
+			MinBackoff: time.Millisecond,
+		})
+
+		msg := retryTask.WithArgs(ctx, make([]byte, 128))
+		maxSize := messageSize(msg)
+
+		Expect(q.Close()).To(Succeed())
+		q = memqueue.NewQueue(&taskq.QueueOptions{
+			Name:    "test",
+			MaxSize: maxSize,
+			Storage: taskq.NewLocalStorage(),
+		})
+		Expect(q.Consumer().Stop()).To(Succeed())
+
+		Expect(q.Add(msg)).To(Succeed())
+		Expect(q.Bytes()).To(Equal(maxSize))
+		Expect(q.Add(message(128))).To(MatchError(taskq.ErrQueueFull))
+
+		Expect(q.Consumer().ProcessAll(ctx)).To(Succeed())
+		Expect(q.Bytes()).To(BeZero())
+	})
+})
+
 var _ = Describe("empty queue", func() {
 	ctx := context.Background()
 	var q *memqueue.Queue

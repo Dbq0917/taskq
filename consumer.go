@@ -146,6 +146,19 @@ func (c *Consumer) Add(msg *Message) error {
 	return nil
 }
 
+// TryAdd adds a message if there is room in the buffer.
+func (c *Consumer) TryAdd(msg *Message) error {
+	ctx := msg.Ctx
+	_ = c.limiter.Reserve(ctx, 1)
+	select {
+	case c.buffer <- msg:
+		return nil
+	default:
+		c.limiter.Cancel(1)
+		return ErrQueueFull
+	}
+}
+
 // Start starts consuming messages in the queue.
 func (c *Consumer) Start(ctx context.Context) error {
 	if err := c.start(); err != nil {

@@ -2,12 +2,17 @@ package taskq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime"
 	"time"
 
 	"github.com/go-redis/redis_rate/v9"
 )
+
+// ErrQueueFull is returned when adding a message would exceed the queue
+// capacity.
+var ErrQueueFull = errors.New("taskq: queue is full")
 
 type QueueOptions struct {
 	// Queue name.
@@ -39,6 +44,10 @@ type QueueOptions struct {
 	// Size of the buffer where reserved messages are stored.
 	// Default is the same as ReservationSize.
 	BufferSize int
+	// Maximum total size of messages in the queue, in bytes.
+	// The size is measured using the serialized message arguments.
+	// The limit is disabled when MaxSize is zero.
+	MaxSize int64
 
 	// Number of consecutive failures after which queue processing is paused.
 	// Default is 100 failures.
