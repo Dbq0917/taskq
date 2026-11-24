@@ -4,18 +4,40 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/vmihailenco/msgpack/v5"
 
 	"github.com/vmihailenco/taskq/v3"
 	"github.com/vmihailenco/taskq/v3/internal"
 	"github.com/vmihailenco/taskq/v3/internal/msgutil"
 )
 
+// persistInterval is how often delayed messages are flushed to disk when
+// persistence is enabled, so that a single write covers the whole batch of
+// waiting messages instead of writing once per message.
+const persistInterval = time.Second
+
+type persistedMessage struct {
+	// Deadline is the moment the message becomes due, in Unix nanoseconds.
+	Deadline int64
+	Msg      []byte
+}
+
+type schedEntry struct {
+	timer    *time.Timer
+	deadline time.Time
+}
+
 type scheduler struct {
+	path string
+
 	timerLock sync.Mutex
-	timerMap  map[*taskq.Message]*time.Timer
+	timerMap  map[*taskq.Message]*schedEntry
 }
 
 func (q *scheduler) Schedule(msg *taskq.Message, fn func()) {
@@ -32,18 +54,21 @@ func (q *scheduler) Schedule(msg *taskq.Message, fn func()) {
 	})
 
 	if q.timerMap == nil {
-		q.timerMap = make(map[*taskq.Message]*time.Timer)
+		q.timerMap = make(map[*taskq.Message]*schedEntry)
 	}
-	q.timerMap[msg] = timer
+	q.timerMap[msg] = &schedEntry{
+		timer:    timer,
+		deadline: time.Now().Add(msg.Delay),
+	}
 }
 
 func (q *scheduler) Remove(msg *taskq.Message) {
 	q.timerLock.Lock()
 	defer q.timerLock.Unlock()
 
-	timer, ok := q.timerMap[msg]
+	entry, ok := q.timerMap[msg]
 	if ok {
-		timer.Stop()
+		entry.timer.Stop()
 		delete(q.timerMap, msg)
 	}
 }
@@ -53,14 +78,72 @@ func (q *scheduler) Purge() int {
 	defer q.timerLock.Unlock()
 
 	// Stop all delayed items
-	for _, timer := range q.timerMap {
-		timer.Stop()
+	for _, entry := range q.timerMap {
+		entry.timer.Stop()
 	}
 
 	n := len(q.timerMap)
 	q.timerMap = nil
 
 	return n
+}
+
+// persist writes all pending delayed messages together with their deadlines
+// to the persistence file in a single batched write.
+func (q *scheduler) persist() {
+	if q.path == "" {
+		return
+	}
+
+	q.timerLock.Lock()
+	defer q.timerLock.Unlock()
+
+	entries := make([]persistedMessage, 0, len(q.timerMap))
+	for msg, entry := range q.timerMap {
+		b, err := msg.MarshalBinary()
+		if err != nil {
+			internal.Logger.Printf("taskq: persisting message failed: %s", err)
+			continue
+		}
+		entries = append(entries, persistedMessage{
+			Deadline: entry.deadline.UnixNano(),
+			Msg:      b,
+		})
+	}
+
+	if err := writePersistedMessages(q.path, entries); err != nil {
+		internal.Logger.Printf("taskq: persisting delayed messages failed: %s", err)
+	}
+}
+
+func writePersistedMessages(path string, entries []persistedMessage) error {
+	b, err := msgpack.Marshal(entries)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func readPersistedMessages(path string) ([]persistedMessage, error) {
+	b, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var entries []persistedMessage
+	if err := msgpack.Unmarshal(b, &entries); err != nil {
+		return nil, err
+	}
+	return entries, nil
 }
 
 //------------------------------------------------------------------------------
@@ -82,6 +165,9 @@ type Queue struct {
 
 	scheduler scheduler
 
+	persistStop chan struct{}
+	persistDone chan struct{}
+
 	_state int32
 }
 
@@ -97,6 +183,7 @@ func NewQueueMaybeConsumer(startConsumer bool, opt *taskq.QueueOptions) *Queue {
 	q := &Queue{
 		opt: opt,
 	}
+	q.scheduler.path = opt.PersistencePath
 
 	q.consumer = taskq.NewConsumer(q)
 	if startConsumer {
@@ -105,7 +192,56 @@ func NewQueueMaybeConsumer(startConsumer bool, opt *taskq.QueueOptions) *Queue {
 		}
 	}
 
+	if opt.PersistencePath != "" {
+		q.restore()
+		q.persistStop = make(chan struct{})
+		q.persistDone = make(chan struct{})
+		go q.persistLoop()
+	}
+
 	return q
+}
+
+// persistLoop periodically flushes pending delayed messages to disk so that
+// the backoff state survives a process restart.
+func (q *Queue) persistLoop() {
+	defer close(q.persistDone)
+
+	ticker := time.NewTicker(persistInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			q.scheduler.persist()
+		case <-q.persistStop:
+			return
+		}
+	}
+}
+
+// restore re-enqueues delayed messages persisted by a previous run,
+// keeping the remaining backoff instead of starting it over.
+func (q *Queue) restore() {
+	entries, err := readPersistedMessages(q.scheduler.path)
+	if err != nil {
+		internal.Logger.Printf("taskq: restoring delayed messages failed: %s", err)
+		return
+	}
+
+	for i := range entries {
+		msg := &taskq.Message{Ctx: context.Background()}
+		if err := msg.UnmarshalBinary(entries[i].Msg); err != nil {
+			internal.Logger.Printf("taskq: restoring delayed message failed: %s", err)
+			continue
+		}
+		msg.Delay = time.Until(time.Unix(0, entries[i].Deadline))
+		if msg.Delay < 0 {
+			msg.Delay = 0
+		}
+		q.wg.Add(1)
+		q.enqueueDelayed(msg)
+	}
 }
 
 func (q *Queue) Name() string {
@@ -149,7 +285,16 @@ func (q *Queue) CloseTimeout(timeout time.Duration) error {
 	}
 
 	_ = q.consumer.StopTimeout(timeout)
-	_ = q.Purge()
+
+	if q.persistStop != nil {
+		close(q.persistStop)
+		<-q.persistDone
+		// Flush the still pending delayed messages so that a new queue
+		// using the same persistence file resumes their backoff.
+		q.scheduler.persist()
+	}
+
+	_ = q.purge()
 
 	return err
 }
@@ -199,7 +344,13 @@ func (q *Queue) enqueueMessage(msg *taskq.Message) error {
 	if q.sync {
 		return q.consumer.Process(msg)
 	}
+	return q.enqueueDelayed(msg)
+}
 
+// enqueueDelayed enqueues a message without counting it as a new
+// reservation. It is used for messages restored from the persistence file
+// whose reservation count was already persisted.
+func (q *Queue) enqueueDelayed(msg *taskq.Message) error {
 	if msg.Delay > 0 {
 		q.scheduler.Schedule(msg, func() {
 			// If the queue closed while we were waiting, just return
@@ -245,6 +396,13 @@ func (q *Queue) DeleteBatch(msgs []*taskq.Message) error {
 }
 
 func (q *Queue) Purge() error {
+	err := q.purge()
+	// Explicitly purged messages must not be restored after a restart.
+	q.scheduler.persist()
+	return err
+}
+
+func (q *Queue) purge() error {
 	// Purge any messages already in the consumer
 	err := q.consumer.Purge()
 

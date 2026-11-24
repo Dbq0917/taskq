@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -225,6 +227,73 @@ var _ = Describe("message retry timing", func() {
 			Expect(ch).To(Receive(BeTemporally("~", now.Add(3*backoff), backoff/10)))
 			Expect(ch).NotTo(Receive())
 		})
+	})
+})
+
+var _ = Describe("message retry backoff across restarts", func() {
+	ctx := context.Background()
+	backoff := 500 * time.Millisecond
+	var task *taskq.Task
+	var ch chan time.Time
+	var persistPath string
+
+	newQueue := func() *memqueue.Queue {
+		return memqueue.NewQueue(&taskq.QueueOptions{
+			Name:            "test",
+			Storage:         taskq.NewLocalStorage(),
+			PersistencePath: persistPath,
+		})
+	}
+
+	BeforeEach(func() {
+		ch = make(chan time.Time, 10)
+		persistPath = filepath.Join(os.TempDir(),
+			"taskq-test-"+uuid.NewV4().String()+".bin")
+
+		var count int
+		task = taskq.RegisterTask(&taskq.TaskOptions{
+			Name: "test",
+			Handler: func() error {
+				ch <- time.Now()
+				count++
+				return fmt.Errorf("fake error #%d", count)
+			},
+			RetryLimit: 3,
+			MinBackoff: backoff,
+		})
+	})
+
+	AfterEach(func() {
+		os.Remove(persistPath)
+	})
+
+	It("resumes the remaining backoff instead of starting it over", func() {
+		q := newQueue()
+		_ = q.Add(task.WithArgs(ctx))
+
+		var start time.Time
+		Eventually(ch, backoff).Should(Receive(&start))
+
+		// Simulate a process restart while the message is waiting for its
+		// backoff: the pending message is persisted and then purged.
+		_ = q.CloseTimeout(20 * time.Millisecond)
+
+		// Stay down for about half of the backoff.
+		time.Sleep(backoff / 2)
+
+		q = newQueue()
+		defer q.Close()
+
+		// The retry fires when the original backoff elapses, not right after
+		// the restart and not a full backoff later.
+		var second time.Time
+		Eventually(ch, backoff).Should(Receive(&second))
+		Expect(second).To(BeTemporally("~", start.Add(backoff), backoff/5))
+		// The backoff keeps growing from where it left off.
+		var third time.Time
+		Eventually(ch, 3*backoff).Should(Receive(&third))
+		Expect(third).To(BeTemporally("~", start.Add(3*backoff), backoff/5))
+		Expect(ch).NotTo(Receive())
 	})
 })
 

@@ -56,6 +56,12 @@ type QueueOptions struct {
 	// Optional storage interface. The default is to use Redis.
 	Storage Storage
 
+	// PersistencePath is an optional path of the file where delayed messages
+	// waiting for their backoff are periodically persisted, so that after a
+	// process restart the remaining backoff continues instead of starting
+	// over. Currently only used by memqueue. Empty disables persistence.
+	PersistencePath string
+
 	// Optional message handler. The default is the global Tasks registry.
 	Handler Handler
 
