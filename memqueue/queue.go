@@ -142,13 +142,19 @@ func (q *Queue) CloseTimeout(timeout time.Duration) error {
 	if !atomic.CompareAndSwapInt32(&q._state, stateRunning, stateClosing) {
 		return fmt.Errorf("taskq: %s is already closed", q)
 	}
+
+	startedAt := time.Now()
 	err := q.WaitTimeout(timeout)
+	stopTimeout := timeout - time.Since(startedAt)
+	if stopTimeout < 0 {
+		stopTimeout = 0
+	}
 
 	if !atomic.CompareAndSwapInt32(&q._state, stateClosing, stateClosed) {
 		panic("not reached")
 	}
 
-	_ = q.consumer.StopTimeout(timeout)
+	_ = q.consumer.StopTimeout(stopTimeout)
 	_ = q.Purge()
 
 	return err

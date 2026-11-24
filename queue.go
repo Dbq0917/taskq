@@ -168,8 +168,11 @@ type QueueConsumer interface {
 	Start(ctx context.Context) error
 	// Stop is StopTimeout with 30 seconds timeout.
 	Stop() error
-	// StopTimeout waits workers for timeout duration to finish processing current
-	// messages and stops workers.
+	// StopTimeout stops fetching new messages and waits up to timeout for
+	// workers to finish current messages. If the timeout expires, worker
+	// contexts are canceled so handlers can roll partial work back. Queue
+	// acknowledgments and retries still use a context detached from that
+	// cancellation, and an overdue consumer settles before it is restarted.
 	StopTimeout(timeout time.Duration) error
 	// ProcessAll starts workers to process messages in the queue and then stops
 	// them when all messages are processed.

@@ -59,6 +59,12 @@ type Consumer struct {
 	state       int32 // atomic
 	stopCh      chan struct{}
 
+	fetchersCtx  context.Context
+	stopFetchers context.CancelFunc
+	workersCtx   context.Context
+	stopWorkers  context.CancelFunc
+	settledCh    chan struct{}
+
 	cfgs       *configRoulette
 	numWorker  int32 // atomic
 	numFetcher int32 // atomic
@@ -148,22 +154,28 @@ func (c *Consumer) Add(msg *Message) error {
 
 // Start starts consuming messages in the queue.
 func (c *Consumer) Start(ctx context.Context) error {
-	if err := c.start(); err != nil {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := c.waitForSettledStop(ctx); err != nil {
+		return err
+	}
+	if err := c.start(ctx); err != nil {
 		return err
 	}
 
 	if c.opt.MinNumWorker < c.opt.MaxNumWorker {
 		c.cfgs = newConfigRoulette(c.opt)
 		cfg := c.cfgs.Select(nil, false)
-		c.replaceConfig(ctx, cfg)
+		c.replaceConfig(c.workersCtx, cfg)
 
 		c.fetchersWG.Add(1)
 		go func() {
 			defer c.fetchersWG.Done()
-			c.autotune(ctx, cfg)
+			c.autotune(c.workersCtx, cfg)
 		}()
 	} else {
-		c.replaceConfig(ctx, &consumerConfig{
+		c.replaceConfig(c.workersCtx, &consumerConfig{
 			NumFetcher: 0, // fetcher is automatically started when needed
 			NumWorker:  c.opt.MinNumWorker,
 		})
@@ -172,7 +184,7 @@ func (c *Consumer) Start(ctx context.Context) error {
 	return nil
 }
 
-func (c *Consumer) start() error {
+func (c *Consumer) start(ctx context.Context) error {
 	c.startStopMu.Lock()
 	defer c.startStopMu.Unlock()
 
@@ -180,6 +192,12 @@ func (c *Consumer) start() error {
 	case stateInit:
 		atomic.StoreInt32(&c.state, stateStarted)
 		c.stopCh = make(chan struct{})
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		c.fetchersCtx, c.stopFetchers = context.WithCancel(ctx)
+		c.workersCtx, c.stopWorkers = context.WithCancel(ctx)
+		c.settledCh = make(chan struct{})
 	case stateStarted:
 		return fmt.Errorf("taskq: Consumer is already started")
 	case stateStoppingFetchers, stateStoppingWorkers:
@@ -197,64 +215,161 @@ func (c *Consumer) Stop() error {
 	return c.StopTimeout(stopTimeout)
 }
 
-// StopTimeout waits workers for timeout duration to finish processing current
-// messages and stops workers.
+// StopTimeout stops fetching new messages and waits up to timeout for
+// in-flight handlers to settle. When the timeout expires, the worker context
+// is canceled so handlers can roll partial work back. The returned error does
+// not mean acknowledgment was skipped: settlement continues in the background
+// with an uncanceled context.
 func (c *Consumer) StopTimeout(timeout time.Duration) error {
 	c.startStopMu.Lock()
 	defer c.startStopMu.Unlock()
 
-	switch atomic.LoadInt32(&c.state) {
+	state := atomic.LoadInt32(&c.state)
+	switch state {
 	case stateInit:
 		return fmt.Errorf("taskq: Consumer is not started")
 	case stateStarted:
 		atomic.StoreInt32(&c.state, stateStoppingFetchers)
 		close(c.stopCh)
+		atomic.StoreInt32(&c.numFetcher, -1)
+		if c.stopFetchers != nil {
+			c.stopFetchers()
+		}
 	case stateStoppingFetchers, stateStoppingWorkers:
-		return fmt.Errorf("taskq: Consumer is stopping")
+		// A previous stop attempt may have timed out. Make StopTimeout
+		// idempotent and give the caller another bounded wait.
+	default:
+		panic("taskq: unknown consumer state")
 	}
 
-	// Stop all fetchers.
-	atomic.StoreInt32(&c.numFetcher, -1)
-	defer func() {
-		atomic.StoreInt32(&c.numWorker, -1)
-		atomic.StoreInt32(&c.state, stateInit)
-	}()
-
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-
-	done := make(chan struct{}, 1)
-	go func() {
-		c.fetchersWG.Wait()
-		done <- struct{}{}
-	}()
-
+	deadline := time.Now().Add(timeout)
 	var firstErr error
-	select {
-	case <-done:
-	case <-timer.C:
-		firstErr = fmt.Errorf("taskq: %s: fetchers are not stopped after %s", c, timeout)
+	if atomic.LoadInt32(&c.state) == stateStoppingFetchers {
+		fetchersDone := waitGroupDone(&c.fetchersWG)
+		if err := waitUntil(fetchersDone, deadline); err != nil {
+			firstErr = fmt.Errorf("taskq: %s: fetchers are not stopped after %s", c, timeout)
+		}
+		atomic.StoreInt32(&c.state, stateStoppingWorkers)
 	}
 
-	if !atomic.CompareAndSwapInt32(&c.state, stateStoppingFetchers, stateStoppingWorkers) {
-		panic("not reached")
-	}
-	if firstErr != nil {
+	workersDone := waitGroupDone(&c.workersWG)
+	if err := waitUntil(workersDone, deadline); err != nil {
+		if firstErr == nil {
+			firstErr = fmt.Errorf("taskq: %s: workers are not stopped after %s", c, timeout)
+		}
+		atomic.StoreInt32(&c.numWorker, -1)
+		if c.stopWorkers != nil {
+			c.stopWorkers()
+		}
+		c.resetStateAfterWorkers(workersDone)
 		return firstErr
 	}
 
+	if c.stopWorkers != nil {
+		c.stopWorkers()
+	}
+	c.resetStateLocked()
+	return firstErr
+}
+
+func (c *Consumer) waitForSettledStop(ctx context.Context) error {
+	for {
+		c.startStopMu.Lock()
+		state := atomic.LoadInt32(&c.state)
+		if state != stateStoppingFetchers && state != stateStoppingWorkers {
+			c.startStopMu.Unlock()
+			return nil
+		}
+		settled := c.settledCh
+		c.startStopMu.Unlock()
+
+		if settled == nil {
+			return nil
+		}
+		select {
+		case <-settled:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (c *Consumer) resetStateLocked() {
+	atomic.StoreInt32(&c.numFetcher, 0)
+	atomic.StoreInt32(&c.numWorker, 0)
+	atomic.StoreInt32(&c.state, stateInit)
+	if c.settledCh != nil {
+		close(c.settledCh)
+		c.settledCh = nil
+	}
+}
+
+func waitGroupDone(wg *sync.WaitGroup) <-chan struct{} {
+	done := make(chan struct{}, 1)
 	go func() {
-		c.workersWG.Wait()
-		done <- struct{}{}
+		wg.Wait()
+		close(done)
 	}()
+	return done
+}
+
+func waitUntil(done <-chan struct{}, deadline time.Time) error {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		select {
+		case <-done:
+			return nil
+		default:
+			return context.DeadlineExceeded
+		}
+	}
+
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
 
 	select {
 	case <-done:
+		return nil
 	case <-timer.C:
-		return fmt.Errorf("taskq: %s: workers are not stopped after %s", c, timeout)
+		return context.DeadlineExceeded
 	}
+}
 
+type withoutCancel struct {
+	context.Context
+}
+
+func (withoutCancel) Deadline() (time.Time, bool) {
+	return time.Time{}, false
+}
+
+func (withoutCancel) Done() <-chan struct{} {
 	return nil
+}
+
+func (withoutCancel) Err() error {
+	return nil
+}
+
+func withoutCancelContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return withoutCancel{Context: ctx}
+}
+
+func (c *Consumer) resetStateAfterWorkers(done <-chan struct{}) {
+	go func() {
+		<-done
+
+		c.startStopMu.Lock()
+		defer c.startStopMu.Unlock()
+
+		if atomic.LoadInt32(&c.state) != stateStoppingWorkers {
+			return
+		}
+		c.resetStateLocked()
+	}()
 }
 
 func (c *Consumer) paused() time.Duration {
@@ -269,6 +384,9 @@ func (c *Consumer) addWorker(ctx context.Context, id int32) bool {
 	c.startStopMu.Lock()
 	defer c.startStopMu.Unlock()
 
+	if atomic.LoadInt32(&c.state) != stateStarted || ctx != c.workersCtx {
+		return false
+	}
 	if atomic.CompareAndSwapInt32(&c.numWorker, id, id+1) {
 		c.workersWG.Add(1)
 		go func() {
@@ -288,6 +406,9 @@ func (c *Consumer) addFetcher(ctx context.Context, id int32) bool {
 	c.startStopMu.Lock()
 	defer c.startStopMu.Unlock()
 
+	if atomic.LoadInt32(&c.state) != stateStarted || ctx != c.fetchersCtx {
+		return false
+	}
 	if atomic.CompareAndSwapInt32(&c.numFetcher, id, id+1) {
 		c.fetchersWG.Add(1)
 		go func() {
@@ -299,9 +420,9 @@ func (c *Consumer) addFetcher(ctx context.Context, id int32) bool {
 	return false
 }
 
-func (c *Consumer) ensureFetcher(ctx context.Context) {
+func (c *Consumer) ensureFetcher() {
 	if atomic.LoadInt32(&c.numFetcher) == 0 {
-		c.addFetcher(ctx, 0)
+		c.addFetcher(c.fetchersCtx, 0)
 	}
 }
 
@@ -386,7 +507,13 @@ func (c *Consumer) fetcher(ctx context.Context, fetcherID int32) {
 
 		if pauseTime := c.paused(); pauseTime > 0 {
 			internal.Logger.Printf("%s is automatically paused for dur=%s", c, pauseTime)
-			time.Sleep(pauseTime)
+			select {
+			case <-time.After(pauseTime):
+			case <-c.stopCh:
+				return
+			case <-ctx.Done():
+				return
+			}
 			c.resetPause()
 			continue
 		}
@@ -397,12 +524,21 @@ func (c *Consumer) fetcher(ctx context.Context, fetcherID int32) {
 				atomic.StoreInt32(&c.numFetcher, -1)
 				continue
 			}
+			if ctx.Err() != nil {
+				return
+			}
 
 			const backoff = time.Second
 			internal.Logger.Printf(
 				"%s fetchMessages failed: %s (sleeping for dur=%s)",
 				c, err, backoff)
-			time.Sleep(backoff)
+			select {
+			case <-time.After(backoff):
+			case <-c.stopCh:
+				return
+			case <-ctx.Done():
+				return
+			}
 			continue
 		}
 		if timeout {
@@ -414,7 +550,13 @@ func (c *Consumer) fetcher(ctx context.Context, fetcherID int32) {
 func (c *Consumer) fetchMessages(
 	ctx context.Context, timer *time.Timer, timeout time.Duration,
 ) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	size := c.limiter.Reserve(ctx, c.opt.ReservationSize)
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 
 	msgs, err := c.q.ReserveN(ctx, size, c.opt.WaitTimeout)
 	if err != nil {
@@ -453,7 +595,7 @@ func (c *Consumer) worker(ctx context.Context, workerID int32) {
 	var lock *redislock.Lock
 	defer func() {
 		if lock != nil {
-			_ = lock.Release(ctx)
+			_ = lock.Release(context.Background())
 		}
 	}()
 
@@ -470,7 +612,7 @@ func (c *Consumer) worker(ctx context.Context, workerID int32) {
 
 		msg := c.waitMessage(ctx, timer)
 		if msg == nil {
-			if atomic.LoadInt32(&c.state) >= stateStoppingWorkers {
+			if atomic.LoadInt32(&c.state) >= stateStoppingWorkers || ctx.Err() != nil {
 				return
 			}
 			continue
@@ -490,7 +632,7 @@ func (c *Consumer) waitMessage(ctx context.Context, timer *time.Timer) *Message 
 	default:
 	}
 
-	c.ensureFetcher(ctx)
+	c.ensureFetcher()
 
 	timer.Reset(workerIdleTimeout)
 	select {
@@ -504,6 +646,8 @@ func (c *Consumer) waitMessage(ctx context.Context, timer *time.Timer) *Message 
 		return nil
 	case <-c.stopCh:
 		return nil
+	case <-ctx.Done():
+		return nil
 	}
 }
 
@@ -512,6 +656,7 @@ func (c *Consumer) Process(msg *Message) error {
 	atomic.AddUint32(&c.inFlight, 1)
 
 	if msg.Delay > 0 {
+		msg.Ctx = withoutCancelContext(msg.Ctx)
 		err := c.q.Add(msg)
 		if err != nil {
 			return err
@@ -592,6 +737,11 @@ func (c *Consumer) Put(msg *Message) {
 	if err := c.afterProcessMessage(msg); err != nil {
 		msg.Err = err
 	}
+
+	// Shutdown may cancel the handler context after the grace period. The
+	// terminal queue operation must still use an active context, otherwise a
+	// processed message can remain pending and be redelivered.
+	msg.Ctx = withoutCancelContext(msg.Ctx)
 
 	if msg.Err == nil {
 		c.resetPause()
@@ -729,7 +879,7 @@ func (c *Consumer) lockWorker(
 			internal.Logger.Printf("redislock.Lock failed: %s", err)
 		}
 		if lock != nil {
-			_ = lock.Release(ctx)
+			_ = lock.Release(context.Background())
 			lock = nil
 		}
 
@@ -738,7 +888,7 @@ func (c *Consumer) lockWorker(
 		case <-timer.C:
 		case <-c.stopCh:
 			if lock != nil {
-				_ = lock.Release(ctx)
+				_ = lock.Release(context.Background())
 			}
 			return nil
 		}
@@ -848,7 +998,7 @@ func (c *Consumer) replaceConfig(ctx context.Context, cfg *consumerConfig) {
 			atomic.StoreInt32(&c.numFetcher, cfg.NumFetcher)
 		} else {
 			for id := numFetcher; id < cfg.NumFetcher; id++ {
-				if !c.addFetcher(ctx, id) {
+				if !c.addFetcher(c.fetchersCtx, id) {
 					internal.Logger.Printf("taskq: addFetcher id=%d failed", id)
 				}
 			}
@@ -909,7 +1059,11 @@ func (l *limiter) Reserve(ctx context.Context, max int) int {
 	for {
 		res, err := l.limiter.AllowAtMost(ctx, l.bucket, l.limit, max)
 		if err != nil {
-			time.Sleep(100 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				return 0
+			case <-time.After(100 * time.Millisecond):
+			}
 			continue
 		}
 
@@ -919,7 +1073,18 @@ func (l *limiter) Reserve(ctx context.Context, max int) int {
 		}
 
 		atomic.StoreUint32(&l.allowedCount, 0)
-		time.Sleep(res.RetryAfter)
+		retryTimer := time.NewTimer(res.RetryAfter)
+		select {
+		case <-retryTimer.C:
+		case <-ctx.Done():
+			if !retryTimer.Stop() {
+				select {
+				case <-retryTimer.C:
+				default:
+				}
+			}
+			return 0
+		}
 	}
 }
 

@@ -27,9 +27,10 @@ type Batcher struct {
 
 	timer *time.Timer
 
-	mu     sync.Mutex
-	batch  []*taskq.Message
-	closed bool
+	mu          sync.Mutex
+	lifecycleMu sync.RWMutex
+	batch       []*taskq.Message
+	closed      bool
 }
 
 func NewBatcher(consumer taskq.QueueConsumer, opt *BatcherOptions) *Batcher {
@@ -51,6 +52,9 @@ func (b *Batcher) flush() {
 }
 
 func (b *Batcher) Add(msg *taskq.Message) error {
+	b.lifecycleMu.RLock()
+	defer b.lifecycleMu.RUnlock()
+
 	var batch []*taskq.Message
 
 	b.mu.Lock()
@@ -109,6 +113,11 @@ func (b *Batcher) onTimeout() {
 }
 
 func (b *Batcher) Close() error {
+	// Wait for Add calls that removed a batch from b.mu and are still
+	// processing it outside the mutex.
+	b.lifecycleMu.Lock()
+	defer b.lifecycleMu.Unlock()
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
